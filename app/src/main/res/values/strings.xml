@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Trace</string>
+    <string name="service_desc">Hiển thị ảnh mờ đè lên màn hình để bạn trace tranh. Không đọc nội dung màn hình.</string>
+</resources>
