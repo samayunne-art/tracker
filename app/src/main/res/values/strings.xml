@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">Trace</string>
-    <string name="service_desc">Hiển thị ảnh mờ đè lên màn hình để bạn trace tranh. Không đọc nội dung màn hình.</string>
+    <string name="service_desc">Hiển thị ảnh mờ đè lên màn hình để trace tranh. Thực hiện lại thao tác zoom 2 ngón của bạn lên app bên dưới, và dùng nút Tăng âm lượng để đổi chế độ. Không đọc nội dung màn hình.</string>
 </resources>

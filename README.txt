@@ -16,3 +16,11 @@ Nếu dùng Android Studio: File > Open thư mục này > Build > Build APK(s).
 2. Mở Trace > "Hiện lớp ảnh" > trên bảng nổi bấm "🔗 Đồng bộ zoom" > Cho phép trong hộp thoại Shizuku > bấm lại nút.
 3. Sang ibisPaint: 1 ngón vẽ -> ảnh đứng yên. 2 ngón zoom/kéo/xoay -> ảnh đi theo.
 Nếu ảnh lệch dần: bấm "✋ Chỉnh ảnh" để khớp lại rồi "✏️ Khoá để vẽ".
+
+CÁCH MỚI (không cần Shizuku): ZOOM CẢ HAI
+Bảng nổi có 3 chế độ:
+  ✏️ Vẽ   : chạm xuyên qua ảnh, vẽ ở ibisPaint như thường.
+  🔍 Zoom : 2 ngón zoom/kéo/xoay trên lớp ảnh. Ảnh đổi ngay, rồi Trace lặp lại đúng cử chỉ đó lên ibisPaint.
+  ✋ Ảnh  : chỉ kéo/zoom riêng ảnh để khớp lại khi bị lệch.
+Nút Tăng âm lượng (Vol+): đổi nhanh giữa Vẽ và Zoom.
+Sau khi cài bản mới: vào Cài đặt > Trợ năng > Trace overlay, TẮT rồi BẬT lại để cấp quyền "thực hiện cử chỉ" và "phím".
