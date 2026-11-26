@@ -17,6 +17,7 @@ import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -40,7 +41,14 @@ import kotlin.math.hypot
  */
 class TraceService : AccessibilityService() {
 
-    companion object { var instance: TraceService? = null }
+    companion object {
+        var instance: TraceService? = null
+        private const val OFF = "🔗 Bám theo: tắt"
+        private const val ON = "🔗 Bám theo: bật"
+        private const val OK = "🔗 Bám theo: bật ✓"
+        private const val ROT_ON = "↻ Xoay: cho phép"
+        private const val ROT_OFF = "🔒 Xoay: khoá"
+    }
 
     private enum class Mode { DRAW, ZOOM, EDIT }
 
@@ -56,6 +64,14 @@ class TraceService : AccessibilityService() {
     private var mode = Mode.DRAW
     private var replaying = false
     private val mat = Matrix()
+
+    // đồng bộ thời gian thực qua Shizuku (tuỳ chọn)
+    private var mirror: TouchMirror? = null
+    private var syncChip: TextView? = null
+    private var prevPinch: FloatArray? = null
+    private var prevKey = 0
+    private var gotFrame = false
+    private var lockRot = false
 
     // trạng thái cử chỉ
     private var lx = 0f
@@ -142,11 +158,12 @@ class TraceService : AccessibilityService() {
     }
 
     fun hide() {
+        stopMirror()
         handler.removeCallbacksAndMessages(null)
         replaying = false
         imageRoot?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-        imageRoot = null; imageView = null; imageLp = null; panel = null; hint = null
+        imageRoot = null; imageView = null; imageLp = null; panel = null; hint = null; syncChip = null
         chips.clear(); rec.clear(); recA = -1; recB = -1
     }
 
@@ -163,7 +180,7 @@ class TraceService : AccessibilityService() {
         updateTouchable()
         for ((k, v) in chips) v.background = chipBg(k == m)
         hint?.text = when (m) {
-            Mode.DRAW -> "Chạm xuyên qua ảnh để vẽ"
+            Mode.DRAW -> if (mirror != null) "Zoom 2 ngón ở app bên dưới, ảnh bám theo" else "Chạm xuyên qua ảnh để vẽ"
             Mode.ZOOM -> "2 ngón zoom/kéo/xoay: ảnh và app bên dưới cùng đổi"
             Mode.EDIT -> "Kéo/zoom riêng ảnh để khớp lại với tranh"
         }
@@ -180,6 +197,48 @@ class TraceService : AccessibilityService() {
         }
     }
 
+    // ---------- bám theo zoom của app khác (Shizuku) ----------
+
+    private fun stopMirror() {
+        mirror?.stop(); mirror = null; prevPinch = null; gotFrame = false
+        syncChip?.text = OFF
+    }
+
+    @Suppress("DEPRECATION")
+    private fun onMirrorFrame(f: TouchMirror.Frame?) {
+        val root = imageRoot
+        if (f == null || root == null || mode != Mode.DRAW || replaying) { prevPinch = null; return }
+        if (!gotFrame) { gotFrame = true; syncChip?.text = OK }
+        val sz = screenSize()
+        val w = sz[0].toFloat()
+        val h = sz[1].toFloat()
+        val rot = wm.defaultDisplay.rotation
+
+        fun mx(fx: Float, fy: Float): Float = when (rot) {
+            Surface.ROTATION_90 -> fy * w
+            Surface.ROTATION_180 -> (1f - fx) * w
+            Surface.ROTATION_270 -> (1f - fy) * w
+            else -> fx * w
+        }
+        fun my(fx: Float, fy: Float): Float = when (rot) {
+            Surface.ROTATION_90 -> (1f - fx) * h
+            Surface.ROTATION_180 -> (1f - fy) * h
+            Surface.ROTATION_270 -> fx * h
+            else -> fy * h
+        }
+
+        val loc = IntArray(2)
+        root.getLocationOnScreen(loc)
+        val n = pinchOf(
+            mx(f.x1, f.y1) - loc[0], my(f.x1, f.y1) - loc[1],
+            mx(f.x2, f.y2) - loc[0], my(f.x2, f.y2) - loc[1]
+        )
+        val pv = prevPinch
+        if (pv != null && prevKey == f.key) applyPinch(pv, n)
+        prevPinch = n
+        prevKey = f.key
+    }
+
     // ---------- biến đổi ảnh ----------
 
     /** [tâm x, tâm y, khoảng cách, góc độ] của 2 ngón */
@@ -189,8 +248,8 @@ class TraceService : AccessibilityService() {
     )
 
     private fun applyPinch(o: FloatArray, n: FloatArray) {
-        val s = (if (o[2] > 0f) n[2] / o[2] else 1f).coerceIn(0.5f, 2f)
-        var da = n[3] - o[3]
+        val s = (if (o[2] > 0f) n[2] / o[2] else 1f).coerceIn(0.2f, 5f)
+        var da = if (lockRot) 0f else n[3] - o[3]
         if (da > 180f) da -= 360f
         if (da < -180f) da += 360f
         mat.postScale(s, s, o[0], o[1])
@@ -274,6 +333,16 @@ class TraceService : AccessibilityService() {
         // chạm nhẹ 2 ngón (không di chuyển) thì bỏ qua, tránh vô tình kích hoạt "hoàn tác" ở app bên dưới
         if (hypot(l[0] - f[0], l[1] - f[1]) < 12f && abs(l[2] - f[2]) < 12f && abs(l[3] - f[3]) < 3f) return
 
+        val a0 = atan2((first[4] - first[2]).toDouble(), (first[3] - first[1]).toDouble())
+        fun fix(p: FloatArray): FloatArray {
+            if (!lockRot) return p
+            val cx = (p[1] + p[3]) / 2f
+            val cy = (p[2] + p[4]) / 2f
+            val r = hypot(p[3] - p[1], p[4] - p[2]) / 2f
+            val dx = (kotlin.math.cos(a0) * r).toFloat()
+            val dy = (kotlin.math.sin(a0) * r).toFloat()
+            return floatArrayOf(p[0], cx - dx, cy - dy, cx + dx, cy + dy)
+        }
         val step = maxOf(1, pts.size / 16)
         val sel = pts.filterIndexed { i, _ -> i % step == 0 || i == pts.size - 1 }
         val loc = IntArray(2)
@@ -281,19 +350,21 @@ class TraceService : AccessibilityService() {
         fun c(v: Float) = if (v < 0f) 0f else v
         val pa = Path()
         val pb = Path()
-        sel.forEachIndexed { i, p ->
+        sel.forEachIndexed { i, raw ->
+            val p = fix(raw)
             val ax = c(p[1] + loc[0]); val ay = c(p[2] + loc[1])
             val bx = c(p[3] + loc[0]); val by = c(p[4] + loc[1])
             if (i == 0) { pa.moveTo(ax, ay); pb.moveTo(bx, by) }
             else { pa.lineTo(ax, ay); pb.lineTo(bx, by) }
         }
-        val dur = (last[0] - first[0]).toLong().coerceIn(150L, 800L)
+        val dur = (last[0] - first[0]).toLong().coerceIn(100L, 800L)
         replay(listOf(pa, pb), dur)
     }
 
     /** Lặp lại cử chỉ 2 ngón lên app bên dưới (lớp ảnh tạm thời cho chạm xuyên qua) */
     private fun replay(paths: List<Path>, dur: Long) {
         replaying = true
+        hint?.text = "⏳ Đang đồng bộ, đợi chút rồi hãy zoom tiếp"
         updateTouchable()
         handler.postDelayed({
             val b = GestureDescription.Builder()
@@ -305,13 +376,13 @@ class TraceService : AccessibilityService() {
                 }, null)
             } catch (e: Exception) { false }
             if (!ok) finishReplay()
-        }, 150L)
+        }, 80L)
         handler.postDelayed({ if (replaying) finishReplay() }, dur + 2000L)
     }
 
     private fun finishReplay() {
         replaying = false
-        updateTouchable()
+        setMode(mode)
     }
 
     // ---------- bảng điều khiển nổi ----------
@@ -352,6 +423,34 @@ class TraceService : AccessibilityService() {
                 override fun onStopTrackingTouch(s: SeekBar?) {}
             })
         }
+        val syncBtn = chip(OFF) { b ->
+            if (mirror != null) {
+                stopMirror(); setMode(mode)
+            } else {
+                val err = TouchMirror.ready()
+                if (err != null) {
+                    toast(err)
+                } else {
+                    gotFrame = false
+                    mirror = TouchMirror(
+                        onFrame = { onMirrorFrame(it) },
+                        onDead = { msg -> toast(msg); stopMirror(); setMode(mode) }
+                    ).also { it.start() }
+                    b.text = ON
+                    setMode(mode)
+                }
+            }
+        }
+        syncChip = syncBtn
+        val lockBtn = chip(if (lockRot) ROT_OFF else ROT_ON) { b ->
+            lockRot = !lockRot
+            b.text = if (lockRot) ROT_OFF else ROT_ON
+        }
+        val row2 = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(syncBtn)
+            addView(lockBtn, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = p(6) })
+        }
         val hintView = TextView(this).apply {
             setTextColor(0xCCFFFFFF.toInt()); textSize = 11f
         }
@@ -363,6 +462,7 @@ class TraceService : AccessibilityService() {
             background = GradientDrawable().apply { setColor(Color.argb(230, 34, 34, 34)); cornerRadius = p(16).toFloat() }
             addView(row)
             addView(seek, LinearLayout.LayoutParams(p(250), -2))
+            addView(row2, LinearLayout.LayoutParams(-2, -2).apply { topMargin = p(6); bottomMargin = p(4) })
             addView(hintView)
         }
         val lp = WindowManager.LayoutParams(

@@ -31,6 +31,21 @@ class TouchMirror(
     }
 
     private val main = Handler(Looper.getMainLooper())
+    private val posted = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var pendingFrame: Frame? = null
+    @Volatile private var hasPending = false
+
+    /** Chỉ giữ khung mới nhất: zoom nhanh cũng không bị dồn việc ở luồng chính */
+    private fun emit(f: Frame?) {
+        pendingFrame = f
+        hasPending = true
+        if (posted.compareAndSet(false, true)) {
+            main.post {
+                posted.set(false)
+                if (hasPending) { hasPending = false; onFrame(pendingFrame) }
+            }
+        }
+    }
     @Volatile private var running = false
     @Volatile private var proc: Process? = null
 
@@ -65,6 +80,7 @@ class TouchMirror(
         // 1. tìm thiết bị màn hình cảm ứng + khoảng giá trị toạ độ
         val info = sh("getevent", "-pl")
         val text = info.inputStream.bufferedReader().readText()
+        val infoErr = try { info.errorStream.bufferedReader().readText().trim() } catch (e: Exception) { "" }
         info.destroy()
         var dev: String? = null
         var maxX = 0f
@@ -77,7 +93,7 @@ class TouchMirror(
                 dev = path; maxX = mx; maxY = my
             }
         }
-        if (dev == null) return "Không tìm thấy màn hình cảm ứng"
+        if (dev == null) return "Không tìm thấy màn hình cảm ứng" + (if (infoErr.isNotEmpty()) ": " + infoErr.take(120) else "")
 
         // 2. đọc luồng sự kiện (giao thức multi-touch "B")
         val p = sh("getevent", "-q", dev)
@@ -111,14 +127,16 @@ class TouchMirror(
                     if (b >= 0) {
                         val f = Frame(xs[a], ys[a], xs[b], ys[b], ids[a] * 31 + ids[b])
                         pinching = true
-                        main.post { onFrame(f) }
+                        emit(f)
                     } else if (pinching) {
                         pinching = false
-                        main.post { onFrame(null) }
+                        emit(null)
                     }
                 }
             }
         }
-        return if (running) "Shizuku đã dừng — hãy bật lại đồng bộ" else null
+        if (!running) return null
+        val errText = try { p.errorStream.bufferedReader().readText().trim() } catch (e: Exception) { "" }
+        return if (errText.isNotEmpty()) "getevent báo: " + errText.take(140) else "Shizuku đã dừng — hãy bật lại đồng bộ"
     }
 }

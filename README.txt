@@ -24,3 +24,13 @@ Bảng nổi có 3 chế độ:
   ✋ Ảnh  : chỉ kéo/zoom riêng ảnh để khớp lại khi bị lệch.
 Nút Tăng âm lượng (Vol+): đổi nhanh giữa Vẽ và Zoom.
 Sau khi cài bản mới: vào Cài đặt > Trợ năng > Trace overlay, TẮT rồi BẬT lại để cấp quyền "thực hiện cử chỉ" và "phím".
+
+BÁM THEO ZOOM THỜI GIAN THỰC (cần Shizuku đang chạy)
+Bảng nổi có thêm nút "🔗 Bám theo zoom app khác". Bật nút, để ở chế độ ✏️ Vẽ, rồi zoom 2 ngón ngay trên ibisPaint:
+ảnh bám theo ngón tay (kéo ở đâu ảnh theo ở đó). Chip hiện "✓ đã nhận cử chỉ" nghĩa là máy cho phép đọc cảm ứng.
+Nếu hiện thông báo lỗi (vd "Permission denied") thì hãng đã chặn; dùng chế độ 🔍 Zoom thay thế.
+
+GIẢM LỆCH KHI ZOOM NHANH
+- Bảng nổi có nút "🔒 Xoay: khoá": ảnh sẽ không xoay (chỉ zoom và kéo). Nên bật cùng lúc với việc tắt "Xoay khung nhìn" (View Rotation) trong Cài đặt của ibisPaint.
+- Ở chế độ 🔍 Zoom: chờ dòng "⏳ Đang đồng bộ" biến mất rồi hãy zoom tiếp.
+- Khi vẫn lệch: bấm ✋ Ảnh, kéo/zoom ảnh khớp lại, rồi quay về ✏️ Vẽ.
