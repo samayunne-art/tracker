@@ -3,6 +3,7 @@ package com.example.tracer
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
@@ -33,45 +34,54 @@ import kotlin.math.atan2
 import kotlin.math.hypot
 
 /**
- * 3 chế độ:
- *  VẼ  : lớp ảnh cho chạm xuyên qua, vẽ ở app bên dưới như bình thường.
- *  ZOOM: 2 ngón zoom/kéo/xoay trên lớp ảnh -> ảnh đổi ngay, rồi Trace lặp lại đúng cử chỉ đó lên app bên dưới.
- *  ẢNH : chỉ kéo/zoom riêng ảnh (để khớp lại khi bị lệch).
- * Nút Tăng âm lượng: đổi nhanh VẼ <-> ZOOM.
+ * ✏️ Vẽ  : lớp ảnh cho chạm xuyên qua, vẽ ở app bên dưới.
+ * 🔍 Zoom: 2 ngón zoom/kéo/xoay trên lớp ảnh -> ảnh đổi ngay, rồi lặp lại cử chỉ đó lên app bên dưới.
+ * ✋ Ảnh : chỉ kéo/zoom riêng ảnh để khớp lại.
+ * Tăng âm lượng: đổi Vẽ <-> Zoom. Giảm âm lượng: ẩn/hiện ảnh.
  */
 class TraceService : AccessibilityService() {
 
     companion object {
         var instance: TraceService? = null
-        private const val OFF = "🔗 Bám theo: tắt"
-        private const val ON = "🔗 Bám theo: bật"
-        private const val OK = "🔗 Bám theo: bật ✓"
-        private const val ROT_ON = "↻ Xoay: cho phép"
-        private const val ROT_OFF = "🔒 Xoay: khoá"
+        private val C_OFF = 0x33FFFFFF
+        private val C_SEL = 0xFF2979FF.toInt()
+        private val C_OK = 0xFF2E7D32.toInt()
     }
 
     private enum class Mode { DRAW, ZOOM, EDIT }
 
     private lateinit var wm: WindowManager
+    private lateinit var prefs: SharedPreferences
     private val handler = Handler(Looper.getMainLooper())
     private var dens = 1f
+
     private var imageRoot: FrameLayout? = null
     private var imageView: ImageView? = null
     private var imageLp: WindowManager.LayoutParams? = null
     private var panel: View? = null
+    private var panelLp: WindowManager.LayoutParams? = null
+    private var body: View? = null
+    private var mini: View? = null
     private var hint: TextView? = null
+    private var eyeChip: TextView? = null
+    private var lockChip: TextView? = null
+    private var syncChip: TextView? = null
     private val chips = HashMap<Mode, TextView>()
+
     private var mode = Mode.DRAW
     private var replaying = false
+    private var imageHidden = false
+    private var lockRot = false
+    private var alphaPct = 50
+    private var bmpW = 0
+    private var bmpH = 0
     private val mat = Matrix()
 
-    // đồng bộ thời gian thực qua Shizuku (tuỳ chọn)
+    // bám theo zoom qua Shizuku (tuỳ chọn)
     private var mirror: TouchMirror? = null
-    private var syncChip: TextView? = null
     private var prevPinch: FloatArray? = null
     private var prevKey = 0
     private var gotFrame = false
-    private var lockRot = false
 
     // trạng thái cử chỉ
     private var lx = 0f
@@ -86,6 +96,7 @@ class TraceService : AccessibilityService() {
     override fun onServiceConnected() {
         instance = this
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        prefs = getSharedPreferences("trace_prefs", MODE_PRIVATE)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -97,13 +108,14 @@ class TraceService : AccessibilityService() {
     }
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
-        if (imageRoot != null && event.keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                setMode(if (mode == Mode.DRAW) Mode.ZOOM else Mode.DRAW)
-            }
-            return true
+        if (imageRoot == null) return false
+        val k = event.keyCode
+        if (k != KeyEvent.KEYCODE_VOLUME_UP && k != KeyEvent.KEYCODE_VOLUME_DOWN) return false
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            if (k == KeyEvent.KEYCODE_VOLUME_UP) setMode(if (mode == Mode.DRAW) Mode.ZOOM else Mode.DRAW)
+            else toggleHidden()
         }
-        return false
+        return true
     }
 
     @Suppress("DEPRECATION")
@@ -118,25 +130,76 @@ class TraceService : AccessibilityService() {
         }
     }
 
+    // ---------- vị trí ảnh: nhớ lại, nạp lại ----------
+
+    private fun fit() {
+        val sz = screenSize()
+        mat.setRectToRect(
+            RectF(0f, 0f, bmpW.toFloat(), bmpH.toFloat()),
+            RectF(0f, 0f, sz[0].toFloat(), sz[1].toFloat()),
+            Matrix.ScaleToFit.CENTER
+        )
+    }
+
+    private fun saveState() {
+        if (imageRoot == null) return
+        val v = FloatArray(9)
+        mat.getValues(v)
+        val e = prefs.edit()
+        e.putString("mat", v.joinToString(","))
+        e.putLong("mat_img", prefs.getLong("img_id", 0L))
+        e.putInt("mat_w", bmpW)
+        e.putInt("mat_h", bmpH)
+        e.putInt("alpha", alphaPct)
+        e.putBoolean("lockRot", lockRot)
+        val lp = panelLp
+        if (lp != null) { e.putInt("px", lp.x); e.putInt("py", lp.y) }
+        e.apply()
+    }
+
+    private fun loadSavedMatrix(): Boolean {
+        val s = prefs.getString("mat", null) ?: return false
+        if (prefs.getLong("mat_img", -1L) != prefs.getLong("img_id", 0L)) return false
+        if (prefs.getInt("mat_w", 0) != bmpW || prefs.getInt("mat_h", 0) != bmpH) return false
+        val parts = s.split(",")
+        if (parts.size != 9) return false
+        return try {
+            mat.setValues(FloatArray(9) { parts[it].toFloat() })
+            true
+        } catch (e: Exception) { false }
+    }
+
+    /** Nạp lại ảnh (vd. vừa đổi sang nét viền), giữ nguyên vị trí */
+    fun reloadImage() {
+        val iv = imageView ?: return
+        val bmp = BitmapFactory.decodeFile(File(filesDir, "trace.png").path) ?: return
+        iv.setImageBitmap(bmp)
+        if (bmp.width != bmpW || bmp.height != bmpH) {
+            bmpW = bmp.width; bmpH = bmp.height
+            fit()
+        }
+        iv.imageMatrix = mat
+    }
+
     fun show() {
         hide()
         val file = File(filesDir, "trace.png")
         if (!file.exists()) { toast("Hãy chọn ảnh trước"); return }
         val bmp = BitmapFactory.decodeFile(file.path) ?: return
+        bmpW = bmp.width; bmpH = bmp.height
+        if (!loadSavedMatrix()) fit()
+        alphaPct = prefs.getInt("alpha", 50)
+        lockRot = prefs.getBoolean("lockRot", false)
+        imageHidden = false
 
-        val sz = screenSize()
-        mat.setRectToRect(
-            RectF(0f, 0f, bmp.width.toFloat(), bmp.height.toFloat()),
-            RectF(0f, 0f, sz[0].toFloat(), sz[1].toFloat()),
-            Matrix.ScaleToFit.CENTER
-        )
-        val iv = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.MATRIX
-            setImageBitmap(bmp)
-            imageMatrix = mat
-            alpha = 0.5f
-        }
-        val root = FrameLayout(this).apply { addView(iv, FrameLayout.LayoutParams(-1, -1)) }
+        val iv = ImageView(this)
+        iv.scaleType = ImageView.ScaleType.MATRIX
+        iv.setImageBitmap(bmp)
+        iv.imageMatrix = mat
+        iv.alpha = alphaPct / 100f
+
+        val root = FrameLayout(this)
+        root.addView(iv, FrameLayout.LayoutParams(-1, -1))
         root.setOnTouchListener { _, e -> onOverlayTouch(e) }
 
         val lp = WindowManager.LayoutParams(
@@ -158,31 +221,38 @@ class TraceService : AccessibilityService() {
     }
 
     fun hide() {
+        saveState()
         stopMirror()
         handler.removeCallbacksAndMessages(null)
         replaying = false
         imageRoot?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-        imageRoot = null; imageView = null; imageLp = null; panel = null; hint = null; syncChip = null
+        imageRoot = null; imageView = null; imageLp = null
+        panel = null; panelLp = null; body = null; mini = null; hint = null
+        eyeChip = null; lockChip = null; syncChip = null
         chips.clear(); rec.clear(); recA = -1; recB = -1
     }
 
-    // ---------- chế độ ----------
+    // ---------- chế độ, hiện/ẩn, lật ----------
 
-    private fun chipBg(sel: Boolean) = GradientDrawable().apply {
-        setColor(if (sel) 0xFF2979FF.toInt() else 0x33FFFFFF)
+    private fun chipBgC(color: Int) = GradientDrawable().apply {
+        setColor(color)
         cornerRadius = 12f * dens
     }
+
+    private fun chipBg(sel: Boolean) = chipBgC(if (sel) C_SEL else C_OFF)
 
     private fun setMode(m: Mode) {
         mode = m
         recA = -1; recB = -1; rec.clear()
         updateTouchable()
         for ((k, v) in chips) v.background = chipBg(k == m)
-        hint?.text = when (m) {
-            Mode.DRAW -> if (mirror != null) "Zoom 2 ngón ở app bên dưới, ảnh bám theo" else "Chạm xuyên qua ảnh để vẽ"
-            Mode.ZOOM -> "2 ngón zoom/kéo/xoay: ảnh và app bên dưới cùng đổi"
-            Mode.EDIT -> "Kéo/zoom riêng ảnh để khớp lại với tranh"
+        hint?.text = when {
+            mirror != null && m == Mode.DRAW && gotFrame -> "✓ Đã nhận cử chỉ: ảnh bám theo zoom 2 ngón"
+            mirror != null && m == Mode.DRAW -> "Zoom 2 ngón ở app bên dưới, ảnh sẽ bám theo"
+            m == Mode.DRAW -> "✏️ Vẽ: chạm xuyên qua ảnh"
+            m == Mode.ZOOM -> "🔍 Zoom: 2 ngón, ảnh và app bên dưới cùng đổi"
+            else -> "✋ Ảnh: kéo/zoom riêng ảnh để khớp lại"
         }
     }
 
@@ -197,18 +267,70 @@ class TraceService : AccessibilityService() {
         }
     }
 
+    private fun toggleHidden() {
+        imageHidden = !imageHidden
+        imageView?.visibility = if (imageHidden) View.INVISIBLE else View.VISIBLE
+        eyeChip?.background = chipBg(imageHidden)
+    }
+
+    private fun flipH() {
+        val r = RectF(0f, 0f, bmpW.toFloat(), bmpH.toFloat())
+        mat.mapRect(r)
+        mat.postScale(-1f, 1f, r.centerX(), r.centerY())
+        imageView?.imageMatrix = mat
+        saveState()
+    }
+
+    private fun setMini(on: Boolean) {
+        val padX = (10 * dens).toInt()
+        val padY = (8 * dens).toInt()
+        body?.visibility = if (on) View.GONE else View.VISIBLE
+        mini?.visibility = if (on) View.VISIBLE else View.GONE
+        val pn = panel ?: return
+        if (on) {
+            pn.background = null
+            pn.setPadding(0, 0, 0, 0)
+        } else {
+            pn.background = GradientDrawable().apply {
+                setColor(Color.argb(230, 34, 34, 34))
+                cornerRadius = 16f * dens
+            }
+            pn.setPadding(padX, padY, padX, padY)
+        }
+    }
+
     // ---------- bám theo zoom của app khác (Shizuku) ----------
+
+    private fun toggleSync() {
+        if (mirror != null) { stopMirror(); setMode(mode); return }
+        val err = TouchMirror.ready()
+        if (err != null) { toast(err); return }
+        gotFrame = false
+        mirror = TouchMirror(
+            onFrame = { onMirrorFrame(it) },
+            onDead = { msg -> toast(msg); stopMirror(); setMode(mode) }
+        ).also { it.start() }
+        syncChip?.background = chipBg(true)
+        setMode(mode)
+    }
 
     private fun stopMirror() {
         mirror?.stop(); mirror = null; prevPinch = null; gotFrame = false
-        syncChip?.text = OFF
+        syncChip?.background = chipBg(false)
     }
 
     @Suppress("DEPRECATION")
     private fun onMirrorFrame(f: TouchMirror.Frame?) {
         val root = imageRoot
-        if (f == null || root == null || mode != Mode.DRAW || replaying) { prevPinch = null; return }
-        if (!gotFrame) { gotFrame = true; syncChip?.text = OK }
+        if (f == null || root == null || mode != Mode.DRAW || replaying) {
+            if (prevPinch != null) { prevPinch = null; saveState() }
+            return
+        }
+        if (!gotFrame) {
+            gotFrame = true
+            syncChip?.background = chipBgC(C_OK)
+            setMode(mode)
+        }
         val sz = screenSize()
         val w = sz[0].toFloat()
         val h = sz[1].toFloat()
@@ -271,6 +393,7 @@ class TraceService : AccessibilityService() {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> { lx = e.x; ly = e.y; needInit = false }
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> needInit = true
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> saveState()
             MotionEvent.ACTION_MOVE ->
                 if (e.pointerCount >= 2) {
                     val n = pinchOf(e.getX(0), e.getY(0), e.getX(1), e.getY(1))
@@ -323,6 +446,7 @@ class TraceService : AccessibilityService() {
     }
 
     private fun finishRecording(doReplay: Boolean) {
+        saveState()
         val pts = ArrayList<FloatArray>(rec)
         rec.clear()
         if (!doReplay || pts.size < 3) return
@@ -387,14 +511,49 @@ class TraceService : AccessibilityService() {
 
     // ---------- bảng điều khiển nổi ----------
 
+    /** Kéo bảng; nếu chỉ chạm (không kéo) thì gọi onTap */
+    private fun attachDrag(v: View, onTap: (() -> Unit)?) {
+        var ox = 0f
+        var oy = 0f
+        var sx = 0f
+        var sy = 0f
+        var moved = false
+        v.setOnTouchListener { _, e ->
+            val lp = panelLp
+            if (lp != null) {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        ox = lp.x - e.rawX; oy = lp.y - e.rawY
+                        sx = e.rawX; sy = e.rawY; moved = false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (abs(e.rawX - sx) > 10 * dens || abs(e.rawY - sy) > 10 * dens) moved = true
+                        if (moved) {
+                            lp.x = (e.rawX + ox).toInt(); lp.y = (e.rawY + oy).toInt()
+                            panel?.let { wm.updateViewLayout(it, lp) }
+                        }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (moved) saveState() else onTap?.invoke()
+                    }
+                }
+            }
+            true
+        }
+    }
+
     private fun showPanel(iv: ImageView) {
         dens = resources.displayMetrics.density
         fun p(v: Int) = (v * dens).toInt()
-        fun chip(t: String, f: (TextView) -> Unit) = TextView(this).apply {
-            text = t; setTextColor(Color.WHITE); textSize = 14f
-            setPadding(p(10), p(6), p(10), p(6))
-            background = chipBg(false)
-            setOnClickListener { f(this) }
+        fun gap() = LinearLayout.LayoutParams(-2, -2).apply { rightMargin = p(4) }
+        fun chip(t: String, f: (TextView) -> Unit): TextView {
+            val c = TextView(this)
+            c.text = t; c.setTextColor(Color.WHITE); c.textSize = 15f
+            c.gravity = Gravity.CENTER
+            c.setPadding(p(9), p(6), p(9), p(6))
+            c.background = chipBg(false)
+            c.setOnClickListener { f(c) }
+            return c
         }
         fun modeChip(m: Mode, label: String): TextView {
             val c = chip(label) { setMode(m) }
@@ -402,89 +561,98 @@ class TraceService : AccessibilityService() {
             return c
         }
 
-        val handle = TextView(this).apply {
-            text = "✥"; setTextColor(Color.WHITE); textSize = 20f
-            setPadding(p(8), p(4), p(10), p(4))
-        }
-        val closeBtn = chip("✕") { hide() }
-        val row = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(handle)
-            addView(modeChip(Mode.DRAW, "✏️ Vẽ"))
-            addView(modeChip(Mode.ZOOM, "🔍 Zoom"))
-            addView(modeChip(Mode.EDIT, "✋ Ảnh"))
-            addView(closeBtn)
-        }
-        val seek = SeekBar(this).apply {
-            max = 100; progress = 50
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) { iv.alpha = maxOf(v, 3) / 100f }
-                override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
-            })
-        }
-        val syncBtn = chip(OFF) { b ->
-            if (mirror != null) {
-                stopMirror(); setMode(mode)
-            } else {
-                val err = TouchMirror.ready()
-                if (err != null) {
-                    toast(err)
-                } else {
-                    gotFrame = false
-                    mirror = TouchMirror(
-                        onFrame = { onMirrorFrame(it) },
-                        onDead = { msg -> toast(msg); stopMirror(); setMode(mode) }
-                    ).also { it.start() }
-                    b.text = ON
-                    setMode(mode)
-                }
+        // hàng 1: kéo, 3 chế độ, thu nhỏ, đóng
+        val handle = TextView(this)
+        handle.text = "✥"; handle.setTextColor(Color.WHITE); handle.textSize = 20f
+        handle.setPadding(p(8), p(2), p(10), p(2))
+        attachDrag(handle, null)
+        val row1 = LinearLayout(this)
+        row1.gravity = Gravity.CENTER_VERTICAL
+        row1.addView(handle)
+        row1.addView(modeChip(Mode.DRAW, "✏️"), gap())
+        row1.addView(modeChip(Mode.ZOOM, "🔍"), gap())
+        row1.addView(modeChip(Mode.EDIT, "✋"), gap())
+        row1.addView(chip("—") { setMini(true) }, gap())
+        row1.addView(chip("✕") { hide() })
+
+        // thanh độ mờ
+        val seek = SeekBar(this)
+        seek.max = 100
+        seek.progress = alphaPct
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) {
+                alphaPct = v
+                iv.alpha = maxOf(v, 3) / 100f
             }
-        }
-        syncChip = syncBtn
-        val lockBtn = chip(if (lockRot) ROT_OFF else ROT_ON) { b ->
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) { saveState() }
+        })
+
+        // hàng 2: ẩn/hiện, lật, khoá xoay, bám theo
+        val eye = chip("👁") { toggleHidden() }
+        eyeChip = eye
+        val flip = chip("⇋") { flipH() }
+        val lock = chip(if (lockRot) "🔒" else "↻") { b ->
             lockRot = !lockRot
-            b.text = if (lockRot) ROT_OFF else ROT_ON
+            b.text = if (lockRot) "🔒" else "↻"
+            b.background = chipBg(lockRot)
+            saveState()
         }
-        val row2 = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            addView(syncBtn)
-            addView(lockBtn, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = p(6) })
-        }
-        val hintView = TextView(this).apply {
-            setTextColor(0xCCFFFFFF.toInt()); textSize = 11f
-        }
+        lock.background = chipBg(lockRot)
+        lockChip = lock
+        val sync = chip("🔗") { toggleSync() }
+        syncChip = sync
+        val row2 = LinearLayout(this)
+        row2.gravity = Gravity.CENTER_VERTICAL
+        row2.addView(eye, gap())
+        row2.addView(flip, gap())
+        row2.addView(lock, gap())
+        row2.addView(sync)
+
+        val hintView = TextView(this)
+        hintView.setTextColor(0xCCFFFFFF.toInt())
+        hintView.textSize = 11f
         hint = hintView
 
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(p(10), p(8), p(10), p(8))
-            background = GradientDrawable().apply { setColor(Color.argb(230, 34, 34, 34)); cornerRadius = p(16).toFloat() }
-            addView(row)
-            addView(seek, LinearLayout.LayoutParams(p(250), -2))
-            addView(row2, LinearLayout.LayoutParams(-2, -2).apply { topMargin = p(6); bottomMargin = p(4) })
-            addView(hintView)
+        val bodyView = LinearLayout(this)
+        bodyView.orientation = LinearLayout.VERTICAL
+        bodyView.addView(row1)
+        bodyView.addView(seek, LinearLayout.LayoutParams(p(240), -2))
+        val r2lp = LinearLayout.LayoutParams(-2, -2)
+        r2lp.topMargin = p(4); r2lp.bottomMargin = p(2)
+        bodyView.addView(row2, r2lp)
+        bodyView.addView(hintView)
+
+        // nút tròn nhỏ khi thu nhỏ bảng
+        val miniView = TextView(this)
+        miniView.text = "◐"; miniView.setTextColor(Color.WHITE); miniView.textSize = 20f
+        miniView.gravity = Gravity.CENTER
+        miniView.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.argb(210, 34, 34, 34))
         }
+        miniView.visibility = View.GONE
+        attachDrag(miniView) { setMini(false) }
+
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.addView(bodyView)
+        box.addView(miniView, LinearLayout.LayoutParams(p(44), p(44)))
+        body = bodyView; mini = miniView; panel = box
+
+        val sz = screenSize()
         val lp = WindowManager.LayoutParams(
             -2, -2,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = p(16); y = p(120) }
-
-        var ox = 0f
-        var oy = 0f
-        handle.setOnTouchListener { _, e ->
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { ox = lp.x - e.rawX; oy = lp.y - e.rawY }
-                MotionEvent.ACTION_MOVE -> {
-                    lp.x = (e.rawX + ox).toInt(); lp.y = (e.rawY + oy).toInt()
-                    wm.updateViewLayout(box, lp)
-                }
-            }
-            true
-        }
-        wm.addView(box, lp); panel = box
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = prefs.getInt("px", p(16)).coerceIn(0, maxOf(0, sz[0] - p(60)))
+        lp.y = prefs.getInt("py", p(120)).coerceIn(0, maxOf(0, sz[1] - p(60)))
+        panelLp = lp
+        wm.addView(box, lp)
+        setMini(false)
         setMode(Mode.DRAW)
     }
 

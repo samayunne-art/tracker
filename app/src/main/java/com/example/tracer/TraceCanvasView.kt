@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
@@ -14,9 +16,8 @@ import kotlin.math.atan2
 import kotlin.math.hypot
 
 /**
- * Canvas vẽ: ảnh mẫu + nét vẽ dùng CHUNG một ma trận biến đổi,
- * nên zoom / kéo / xoay thì ảnh và nét vẽ luôn khớp nhau.
- * 1 ngón = vẽ. 2 ngón = zoom + kéo + xoay.
+ * Canvas vẽ: ảnh mẫu + nét vẽ dùng CHUNG một ma trận biến đổi.
+ * 1 ngón = vẽ (hoặc tẩy). 2 ngón = zoom + kéo + xoay.
  */
 class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
 
@@ -28,14 +29,16 @@ class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
     var showRef = true
         set(v) { field = v; invalidate() }
     var brushColor = Color.BLACK
-    var brushSize = 4f // đơn vị theo pixel của ảnh (không phải pixel màn hình)
+    var brushSize = 4f
+    var erasing = false
 
     private val page = RectF(0f, 0f, ref.width.toFloat(), ref.height.toFloat())
-    private val m = Matrix()   // thế giới -> màn hình
+    private val m = Matrix()
     private val inv = Matrix()
 
     private class Stroke(val path: Path, val paint: Paint)
     private val strokes = ArrayList<Stroke>()
+    private val redoStack = ArrayList<Stroke>()
     private var cur: Stroke? = null
     private var pts = 0
     private var lastX = 0f
@@ -58,14 +61,24 @@ class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
         invalidate()
     }
 
-    fun undo() { if (strokes.isNotEmpty()) { strokes.removeAt(strokes.size - 1); invalidate() } }
-    fun clear() { strokes.clear(); invalidate() }
+    fun undo() {
+        if (strokes.isNotEmpty()) { redoStack.add(strokes.removeAt(strokes.size - 1)); invalidate() }
+    }
 
-    fun export(): Bitmap {
+    fun redo() {
+        if (redoStack.isNotEmpty()) { strokes.add(redoStack.removeAt(redoStack.size - 1)); invalidate() }
+    }
+
+    fun clear() { strokes.clear(); redoStack.clear(); invalidate() }
+
+    /** whiteBg = false: nền trong suốt (chỉ có nét) để nhập vào app vẽ làm layer */
+    fun export(whiteBg: Boolean): Bitmap {
         val bmp = Bitmap.createBitmap(ref.width, ref.height, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
-        c.drawRect(page, paperPaint)
+        if (whiteBg) c.drawRect(page, paperPaint)
+        val layer = c.saveLayer(page, null)
         for (s in strokes) c.drawPath(s.path, s.paint)
+        c.restoreToCount(layer)
         return bmp
     }
 
@@ -76,7 +89,10 @@ class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
         c.clipRect(page)
         c.drawRect(page, paperPaint)
         if (showRef) c.drawBitmap(ref, 0f, 0f, refPaint)
+        // nét vẽ nằm trong 1 lớp riêng để tẩy chỉ xoá nét, không xoá nền và ảnh mẫu
+        val layer = c.saveLayer(page, null)
         for (s in strokes) c.drawPath(s.path, s.paint)
+        c.restoreToCount(layer)
         c.restore()
     }
 
@@ -118,20 +134,25 @@ class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
         invalidate()
     }
 
+    private fun newPaint(): Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        strokeWidth = brushSize
+        if (erasing) {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+        } else {
+            color = brushColor
+        }
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 gesturing = false
                 val p = toWorld(e.x, e.y)
                 val path = Path().apply { moveTo(p[0], p[1]); lineTo(p[0] + 0.01f, p[1]) }
-                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.STROKE
-                    strokeCap = Paint.Cap.ROUND
-                    strokeJoin = Paint.Join.ROUND
-                    color = brushColor
-                    strokeWidth = brushSize
-                }
-                val s = Stroke(path, paint)
+                val s = Stroke(path, newPaint())
                 strokes.add(s); cur = s
                 lastX = p[0]; lastY = p[1]; pts = 0
                 invalidate()
@@ -139,7 +160,9 @@ class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
             MotionEvent.ACTION_POINTER_DOWN -> {
                 if (!gesturing) {
                     val c = cur
-                    if (c != null && pts < 5) strokes.remove(c) // chạm nhầm trước khi đặt ngón thứ 2
+                    if (c != null) {
+                        if (pts < 5) strokes.remove(c) else redoStack.clear()
+                    }
                     cur = null
                     gesturing = true
                 }
@@ -160,7 +183,11 @@ class TraceCanvasView(ctx: Context, private val ref: Bitmap) : View(ctx) {
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                cur?.path?.lineTo(lastX, lastY)
+                val c = cur
+                if (c != null) {
+                    c.path.lineTo(lastX, lastY)
+                    redoStack.clear()
+                }
                 cur = null; gesturing = false
                 invalidate()
             }

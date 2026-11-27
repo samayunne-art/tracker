@@ -34,3 +34,8 @@ GIẢM LỆCH KHI ZOOM NHANH
 - Bảng nổi có nút "🔒 Xoay: khoá": ảnh sẽ không xoay (chỉ zoom và kéo). Nên bật cùng lúc với việc tắt "Xoay khung nhìn" (View Rotation) trong Cài đặt của ibisPaint.
 - Ở chế độ 🔍 Zoom: chờ dòng "⏳ Đang đồng bộ" biến mất rồi hãy zoom tiếp.
 - Khi vẫn lệch: bấm ✋ Ảnh, kéo/zoom ảnh khớp lại, rồi quay về ✏️ Vẽ.
+
+BẢN MỚI: nét viền · sửa ảnh xoay · lật/ẩn ảnh · nhớ vị trí · thu nhỏ bảng · tẩy/làm lại/xuất PNG trong suốt · icon · hướng dẫn
+- minSdk nâng lên 26 (Android 8 trở lên).
+- Phím Giảm âm lượng: ẩn/hiện ảnh (Tăng âm lượng: đổi Vẽ <-> Zoom).
+- Sau khi cài bản mới: tắt rồi bật lại Trace overlay trong Trợ năng.
